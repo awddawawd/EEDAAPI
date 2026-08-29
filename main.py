@@ -118,9 +118,9 @@ def get_client():
 # ENDPOINTS
 # ---------------------------------------------------------
 
-@app.get("/ping")
+@app.api_route("/ping", methods=["GET", "HEAD"])
 def uptime_ping():
-    """Endpoint for UptimeRobot. Doesn't trigger any EasyEDA logic."""
+    """Endpoint for UptimeRobot (supports both GET and HEAD)."""
     return {"status": "alive", "message": "Pong!"}
 
 @app.post("/update-creds")
