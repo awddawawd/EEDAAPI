@@ -1,29 +1,29 @@
 import os
 import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
+import uvicorn
 
-app = FastAPI()
+app = FastAPI(title="EasyEDA Search API")
 
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# In-memory storage for credentials. Defaults to Environment Variables on startup.
+RUNTIME_CREDS = {
+    "uuid": os.getenv("EASYEDA_UUID"),
+    "cookies": os.getenv("EASYEDA_COOKIES")
+}
 
-class CredsUpdate(BaseModel):
-    path: str
+# A secret key to protect your /update-creds endpoint. Set this in Render Env Vars.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "my_secret_key_123")
+
+class CredsPayload(BaseModel):
+    uuid: str
     cookies: str
-    admin_secret: str
 
-class EasyEDAProxy:
+class EasyEDAClient:
     def __init__(self):
         self.base_url = "https://pro.easyeda.com"
         self.session = requests.Session()
+        self.user_uuid = None
         
         self.session.headers.update({
             "Content-Type": "application/json",
@@ -32,24 +32,47 @@ class EasyEDAProxy:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
         
-        # Load initial credentials from environment variables on startup
-        initial_uuid = os.getenv("EASYEDA_UUID", "")
-        initial_cookies = os.getenv("EASYEDA_COOKIES", "")
-        if initial_uuid and initial_cookies:
-            self.update_credentials(initial_uuid, initial_cookies)
+        self._load_credentials()
 
-    def update_credentials(self, new_path: str, new_cookies: str):
-        """Updates the session path and cookies in memory."""
-        self.user_uuid = new_path
+    def _load_credentials(self):
+        """Loads from our in-memory RUNTIME_CREDS dictionary."""
+        self.user_uuid = RUNTIME_CREDS.get("uuid")
+        cookies_str = RUNTIME_CREDS.get("cookies")
+
+        if not self.user_uuid or not cookies_str:
+            raise ValueError("Missing UUID or COOKIES. Use the /update-creds endpoint to set them.")
+
         self.session.headers.update({"path": self.user_uuid})
         
+        # Apply cookies
         self.session.cookies.clear()
-        for item in new_cookies.split(';'):
+        cookie_dict = {}
+        for item in cookies_str.split(';'):
             if '=' in item:
-                k, v = item.strip().split('=', 1)
-                self.session.cookies.set(k, v)
+                key, value = item.strip().split('=', 1)
+                cookie_dict[key] = value
+        self.session.cookies.update(cookie_dict)
 
-    def search_and_enrich(self, keyword: str, page: int = 1, page_size: int = 10):
+    def _post_with_retry(self, url, payload):
+        if "path" in payload:
+            payload["path"] = self.user_uuid
+        if "uid" in payload:
+            payload["uid"] = self.user_uuid
+
+        response = self.session.post(url, json=payload)
+        data = response.json()
+        
+        if not data.get("success"):
+            error_code = data.get("code")
+            if error_code == 401 or error_code == -1 or "login" in data.get("msg", "").lower():
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Session expired. Please use /update-creds to inject fresh cookies."
+                )
+        
+        return data
+
+    def search_devices(self, keyword, page=1, page_size=10):
         url = f"{self.base_url}/api/devices/search"
         payload = {
             "wd": keyword,
@@ -57,18 +80,17 @@ class EasyEDAProxy:
             "pageSize": page_size,
             "tag": [],
             "attributes": {},
-            "path": getattr(self, 'user_uuid', ''),
-            "uid": getattr(self, 'user_uuid', '')
         }
+        return self._post_with_retry(url, payload)
+
+    def search_and_enrich(self, keyword, page=1, page_size=10):
+        search_data = self.search_devices(keyword, page, page_size)
         
-        response = self.session.post(url, json=payload)
-        data = response.json()
-        
-        if not data.get("success"):
-            raise HTTPException(status_code=400, detail=data.get("msg", "EasyEDA API Error - Credentials might be expired"))
+        if not search_data.get("success"):
+            raise HTTPException(status_code=400, detail=search_data.get('msg'))
 
         results = []
-        lists = data.get("result", {}).get("lists", {})
+        lists = search_data.get("result", {}).get("lists", {})
         all_items = lists.get("lcsc", []) + lists.get("user", [])
 
         for item in all_items:
@@ -84,28 +106,46 @@ class EasyEDAProxy:
 
         return results
 
-proxy = EasyEDAProxy()
+client = None
 
-# --- 1. UPTIMEROBOT KEEP-ALIVE ENDPOINT ---
-@app.get("/")
-def health_check():
-    """Pinged by UptimeRobot every 5 minutes to keep the server awake."""
-    return {"status": "alive", "message": "Service is running."}
+def get_client():
+    global client
+    if client is None:
+        client = EasyEDAClient()
+    return client
 
-# --- 2. SEARCH ENDPOINT ---
-@app.get("/api/search")
-def search(keyword: str = Query(..., min_length=1), page: int = 1, pageSize: int = 10):
-    return proxy.search_and_enrich(keyword, page, pageSize)
+# ---------------------------------------------------------
+# ENDPOINTS
+# ---------------------------------------------------------
 
-# --- 3. UPDATE CREDENTIALS ENDPOINT ---
-@app.post("/api/update_credentials")
-def update_creds(data: CredsUpdate):
-    """Allows updating credentials dynamically via POST request."""
-    # Protect this endpoint with a secret password
-    expected_secret = os.getenv("ADMIN_SECRET", "change_me_in_render")
+@app.get("/ping")
+def uptime_ping():
+    """Endpoint for UptimeRobot. Doesn't trigger any EasyEDA logic."""
+    return {"status": "alive", "message": "Pong!"}
+
+@app.post("/update-creds")
+def update_credentials(payload: CredsPayload, x_api_key: str = Header(...)):
+    """Updates the credentials in memory without restarting the server."""
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key.")
     
-    if data.admin_secret != expected_secret:
-        raise HTTPException(status_code=403, detail="Unauthorized: Invalid admin secret.")
-        
-    proxy.update_credentials(data.path, data.cookies)
-    return {"status": "success", "message": "EasyEDA credentials updated successfully in memory."}
+    RUNTIME_CREDS["uuid"] = payload.uuid
+    RUNTIME_CREDS["cookies"] = payload.cookies
+    
+    # Force the client to re-initialize next time get_client() is called
+    global client
+    client = None 
+    
+    return {"status": "success", "message": "Credentials updated in memory successfully."}
+
+@app.get("/search")
+def search_api(keyword: str, page: int = 1, page_size: int = 10):
+    try:
+        c = get_client()
+        return {"keyword": keyword, "results": c.search_and_enrich(keyword, page, page_size)}
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
