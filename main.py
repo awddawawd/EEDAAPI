@@ -1,17 +1,19 @@
 import os
 import requests
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# Add this block to allow your HTML file to fetch data from this API
+app = FastAPI(title="EasyEDA Search API")
+
+# Enable CORS so your local HTML file can fetch data from Render
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (including localhost)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, OPTIONS, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # In-memory storage for credentials. Defaults to Environment Variables on startup.
